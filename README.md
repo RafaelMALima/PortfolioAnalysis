@@ -1,4 +1,4 @@
-#Portfolio generator
+# Portfolio generator
 
 This package uses historical data to calculate the sharpe rating of different portfolios, made using combinations of the Dow 30.
 
