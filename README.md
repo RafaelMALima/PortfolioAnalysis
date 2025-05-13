@@ -49,3 +49,6 @@ The best sharpe value found was of 3.448845328463113, with a portfolio made up b
 | MCD    | 0.035703 |
 | MRK    | 0.063276 |
 | MSFT   | 0.013938 |
+
+## Honestidade
+Ferramentas de IA foram usadas para ajudar a revisar o código, e para traduzir requisições usando o CURL para as bibliotecas correspondentes
