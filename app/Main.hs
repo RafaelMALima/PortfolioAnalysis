@@ -1,213 +1,158 @@
-{-# LANGUAGE DeriveGeneric #-} -- Add this extension
-{-# LANGUAGE BangPatterns  #-} -- Add this extension
-{-# LANGUAGE DeriveAnyClass#-} -- Add this extension
+{-# LANGUAGE BangPatterns     #-}
+{-# LANGUAGE DeriveAnyClass   #-}
+{-# LANGUAGE DeriveGeneric    #-}
 
-import qualified Data.ByteString.Lazy as B -- For reading file
-import GHC.Generics (Generic)           -- For deriving
-import Data.Aeson (FromJSON, decode, eitherDecode) -- aeson functions
-import System.Directory
-import Data.Either
-import Data.List
-import Data.List.Split
-import Data.Ord
-import Control.Parallel.Strategies
-import System.Random.SplitMix
-import Data.Word
+module Main (main) where
 
--- Add 'Generic' and derive 'FromJSON' for aeson
-data Quote = Quote {  date             :: String
-                    --, open             :: Double
-                    --, high             :: Double
-                    --, low              :: Double
-                    , close            :: Double
-                    --, adjClose         :: Double
-                    --, volume           :: Int
-                    --, unadjustedVolume :: Int
-                    --, change           :: Double
-                    --, changePercent    :: Double
-                    --, vwap             :: Double
-                    --, label            :: String
-                    --, changeOverTime   :: Double 
-} deriving (Show, Eq, Generic, NFData)
+import qualified Data.ByteString.Lazy        as B
+import           Data.Aeson                  (eitherDecode, FromJSON)
+import           Data.Either                 (partitionEithers)
+import           Data.List                   (delete, maximumBy)
+import           Data.Ord                    (comparing)
+import           GHC.Generics                (Generic)
+import           Control.DeepSeq             (NFData)
+import           Control.Parallel.Strategies (rdeepseq, parMap, withStrategy, parListChunk)
+import           System.Directory            (getDirectoryContents)
+import           System.Random.SplitMix      (SMGen, mkSMGen, splitSMGen
+                                             , nextDouble)
+import           Data.Word                   (Word64)
+
+import qualified Data.Vector           as V       -- boxed
+import qualified Data.Vector.Unboxed    as UV      -- flat, unboxed
+
+data Quote = Quote
+  { date  :: !String
+  , close :: !Double
+  } deriving (Show, Eq, Generic, NFData)
 
 instance FromJSON Quote
 
-data StockHistory = StockHistory { symbol     :: String
-, historical :: [Quote]  } deriving (Show, Eq, Generic, NFData)
+data StockHistory = StockHistory
+  { symbol     :: !String
+  , historical :: ![Quote]
+  } deriving (Show, Eq, Generic, NFData)
+
 instance FromJSON StockHistory
 
-data HistoricalStockList = HistoricalStockList { historicalStockList :: [StockHistory]  } deriving (Show, Eq, Generic, NFData)
-instance FromJSON HistoricalStockList -- This instance will now work correctly with aeson!
+newtype HistoricalStockList = HistoricalStockList
+  { historicalStockList :: [StockHistory]
+  } deriving (Show, Eq, Generic, NFData)
+
+instance FromJSON HistoricalStockList
 
 loadStockFile :: FilePath -> IO (Either String HistoricalStockList)
-loadStockFile fp = do
-  rawBytes <- B.readFile fp -- Read as lazy ByteString
-  -- Use eitherDecode for better error messages
-  pure $ eitherDecode rawBytes
+loadStockFile fp = eitherDecode <$> B.readFile fp
 
 combinations :: Int -> [a] -> [[a]]
 combinations 0 _      = [[]]
 combinations _ []     = []
 combinations k (x:xs)
-  | k < 0             = []                         -- guard against misuse
-  | otherwise         = map (x:) (combinations (k-1) xs)
-                       ++       combinations k     xs
+  | k < 0     = []
+  | otherwise = map (x:) (combinations (k-1) xs)
+           ++  combinations k         xs
 
-
---sampleW :: Int -> IO [Double]
---sampleW k = do
---  xs <- Par.replicateM k (randomRIO (1e-12, 1.0))  -- avoid exact zeros
---  let s = sum xs
---  pure $ map (/ s) xs
---
----- Re-sample until the 20 % constraint is satisfied.
---generateWeights :: Int -> IO [Double]
---generateWeights n = do
---   ws <- sampleW n
---   if all (<= 0.20) ws then pure ws else generateWeights n
-
-
-weightLists :: Int -> Int -> Word64 -> [[Double]]
-weightLists m k seed =
-
-  -- Parallel evaluation is entirely optional; remove `parMap rdeepseq`
-  -- if you want to keep it 100 % sequential.
-  parMap rdeepseq (mkWeights k) gens
+weightLists :: Int           -- ^ how many weight vectors
+            -> Int           -- ^ dimension of each vector
+            -> Word64        -- ^ RNG seed
+            -> [UV.Vector Double]
+weightLists m k seed = parMap rdeepseq (mkWeights k) gens
   where
-    -- Split the root generator repeatedly to obtain as many
-    -- independent sub-generators as we need.
     gens :: [SMGen]
     gens = take m $ iterate (snd . splitSMGen) (mkSMGen seed)
 
-    ----------------------------------------------------------------------------
-    -- Given a generator, make one weight vector -------------------------------
-    ----------------------------------------------------------------------------
-    mkWeights :: Int -> SMGen -> [Double]
-    mkWeights n g0 = let !(raw, _) = pull n g0
-                         !s       = sum raw            -- normalising constant
-                     in  map (/ s) raw                -- every list sums to 1
+    mkWeights :: Int -> SMGen -> UV.Vector Double
+    mkWeights n g0 =
+      let !(ws, _) = pull n g0
+          !s       = UV.sum ws
+      in  UV.map (/ s) ws
 
-    -- pull n raw uniform(0,1) doubles and thread the generator state
-    pull :: Int -> SMGen -> ([Double], SMGen)
-    pull 0 !g = ([], g)
+    pull :: Int -> SMGen -> (UV.Vector Double, SMGen)
+    pull 0 !g = (UV.empty, g)
     pull n !g =
       let (!u,  g1)  = nextDouble g
           (!us, g2)  = pull (n-1) g1
-      in  (u:us, g2)
+      in  (UV.cons u us, g2)
 
-weightReturns :: [StockHistory] -> [Double] -> [Double]
-weightReturns !stocks !wRaw
-  | null stocks                 = []
-  | length stocks /= length wRaw = error "weightReturns: weights / stocks length mismatch"
-  | otherwise                   = portfolioReturns
+type ReturnTable = V.Vector (UV.Vector Double)
+
+mkReturnTable :: [StockHistory] -> ReturnTable
+mkReturnTable stocks =
+  let priceSeries   = map (map close . historical) stocks
+      tMin          = minimum (map length priceSeries)
+      trimmedPrices = map (UV.fromList . take tMin) priceSeries
+      returnsCols   = map perStock trimmedPrices
+  in  V.fromList returnsCols
   where
-    --------------------------------------------------------------------------
-    -- 1.  Normalise weights so Σw = 1
-    --------------------------------------------------------------------------
-    !w =
-      let s = sum wRaw
-      in  if s == 0 then error "weightReturns: sum of weights is zero"
-                    else map (/ s) wRaw
+    perStock :: UV.Vector Double -> UV.Vector Double
+    perStock ps = UV.zipWith (\p1 p0 -> (p1 - p0) / p0) (UV.tail ps) ps
 
-    --------------------------------------------------------------------------
-    -- 2.  Pull out close-price series and equalise lengths
-    --------------------------------------------------------------------------
-    priceSeries :: [[Double]]
-    priceSeries = map (map close . historical) stocks         -- [[P_t]]
-    
-    !tMin = minimum (map length priceSeries)                  -- shortest series
-    !trimmedPrices = map (take tMin) priceSeries              -- force equal length
+sharpeFast
+  :: ReturnTable           -- ^ t × n matrix, column-major
+  -> UV.Vector Double      -- ^ weight vector (Σw = 1)
+  -> Double
+sharpeFast table w =
+  let
+      weightedCols :: V.Vector (UV.Vector Double)
+      weightedCols =
+        V.imap (\j col -> UV.map (* (w UV.! j)) col) table
 
-    --------------------------------------------------------------------------
-    -- 3.  Per-stock simple daily returns
-    --------------------------------------------------------------------------
-    returnsPerStock :: [[Double]]                             -- length = tMin-1
-    returnsPerStock =
-      map (\ps -> zipWith (\p1 p0 -> (p1 - p0) / p0) (tail ps) ps)
-          trimmedPrices
+      portfolioR :: UV.Vector Double      -- length = #days
+      portfolioR =
+        V.foldl1' (UV.zipWith (+)) weightedCols
 
-    --------------------------------------------------------------------------
-    -- 4.  Weight every stock’s return series and sum across stocks
-    --------------------------------------------------------------------------
-    weighted :: [[Double]]
-    weighted = zipWith (\wi rs -> map (wi *) rs) w returnsPerStock
+      t :: Double
+      t = fromIntegral (UV.length portfolioR)
 
-    portfolioReturns :: [Double]
-    portfolioReturns = foldl1' (zipWith (+)) weighted
+      meanR :: Double
+      meanR = UV.sum portfolioR / t
+
+      variance :: Double
+      variance =
+        UV.foldl' (\acc r -> let d = r - meanR
+                             in  acc + d*d) 0.0 portfolioR
+        / t
+
+      stdDev = sqrt variance
+  in
+      (252 * meanR) / (sqrt 252 * stdDev)
 
 
-stdev :: [Double] -> Double 
-stdev xs = sqrt . average . map ((^2) . (-) axs) $ xs
-           where average = (/) <$> sum <*> realToFrac . length
-                 axs     = average xs
-
--- No Double average for absolutely no reason. Imagine using float in the big 25
-average :: [Double] -> Double
-average xs =
-  let !s = foldl' (+) 0 xs
-  in  s / fromIntegral (length xs)
-
-sharpe :: [StockHistory] -> [Double] -> Double
-sharpe c w =
-  let wr      = weightReturns c w          -- daily portfolio returns
-      mr      = average wr
-      stdvr   = stdev wr
-      annMr   = mr * 252
-      annStdvr= stdvr * sqrt 252
-  in  annMr / annStdvr
-
-first3 :: (x, y, z) -> x
-first3 (x, _, _) = x        -- extract the first component
+bestSharpePerComb
+  :: [UV.Vector Double]             -- ^ pre-generated weights
+  -> [StockHistory]                 -- ^ one combination of stocks
+  -> (Double, [String], UV.Vector Double)
+bestSharpePerComb weightVectors stocks =
+  let table     = mkReturnTable stocks
+      (best, w) = maximumBy (comparing fst) $
+        parMap rdeepseq
+               (\v -> (sharpeFast table v, v))
+               weightVectors
+  in  (best, map symbol stocks, w)
 
 main :: IO ()
-
 main = do
-  stockFiles <- getDirectoryContents "data" 
-  let cleanFs = delete "." . delete ".."
-  let a = cleanFs stockFiles
-  b <- mapM (loadStockFile . ("data/" ++)) a
-  let (bad, good) = partitionEithers b
+  stockFiles <- fmap (delete "." . delete "..")
+                $ getDirectoryContents "data"
+  results    <- mapM (loadStockFile . ("data/" ++)) stockFiles
+  let (bad, good) = partitionEithers results
+  mapM_ (putStrLn . ("JSON error: " ++)) bad
+  let allStocks = concatMap historicalStockList good
+  putStrLn $ "Merged symbols (" ++ show (length allStocks) ++ "): "
+  print (map symbol allStocks)
 
+  let combs = combinations 25 allStocks
 
+  let k = 10
+  let weightVecs = weightLists k 25 42
 
-  --ṕrint and report errors from parsing JSON data
-  mapM_ (\err -> do putStrLn ("JSON error: " ++ err )) bad
-  let histData = concatMap historicalStockList good
-  --checked if all data was read properly
-  putStrLn $ "Merged symbols (" ++ show (length histData) ++ "):"
-  print (map symbol histData)
-  let !comb = combinations 25 histData
+  let perComb = withStrategy (parListChunk 256 rdeepseq)
+                $ map (bestSharpePerComb weightVecs) combs
 
+  putStrLn "Finished evaluating every combination!"
 
-  --IMPORTANT - number of random samples per combination
-  let k = 1000
-  let !ws = weightLists k 25 42
-  print (head ws)
+  let (bestSharpe, names, bestW) = maximumBy (comparing (\(s,_,_) -> s)) perComb
 
-  let bestTriple = maximumBy (comparing first3)
-
-  let !bct = parMap rdeepseq  (\c -> bestTriple (parMap rdeepseq -- Best combination triple - best triple from each combination
-                                (\w -> ((sharpe c w), (map symbol c), w)) ws
-                              )) comb
-
-  print "Finished calculating best sharpe of each combination"
-  print "Processing sharpe of each chunk"
-
-  let bctChunks  = chunksOf 1000 bct --
-  let !bestSharpes = parMap rdeepseq (\c -> bestTriple c) bctChunks 
-  print "Finished calculating best sharpe of each chunk"
-
-  print "Len"
-  print (length bestSharpes)
-
-  print "Resulting chunks:"
-  print bestSharpes
-
-  let !bestPortfolio = bestTriple bestSharpes
-
-  
-  print "Portfolio with the best sharpe"
-  print bestPortfolio
-
-
-  -- print (head b)
+  putStrLn "\n*** Portfolio with the best Sharpe ***"
+  putStrLn $ "Sharpe: " ++ show bestSharpe
+  putStrLn $ "Stocks : " ++ show names
+  putStrLn $ "Weights: " ++ show (UV.toList bestW)
