@@ -17,7 +17,7 @@ Afterwards, to download the data, simply run
 
 
 
-Despite the parallelism, the project still takes a significant amount of time. With a k of 1000, it took around 2h for the project to run.
+Despite the parallelism, the project still takes a significant amount of time. With a k of 1000, it took around 30m for the project to run.
 Lower values for k, such as 10 or 100 yield significantly faster results
 
 The best sharpe value found was of 3.448845328463113, with a portfolio made up by:
