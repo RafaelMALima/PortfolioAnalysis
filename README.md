@@ -50,5 +50,5 @@ The best sharpe value found was of 3.448845328463113, with a portfolio made up b
 | MRK    | 0.063276 |
 | MSFT   | 0.013938 |
 
-## Honestidade
-Ferramentas de IA foram usadas para ajudar a revisar o código, e para traduzir requisições usando o CURL para as bibliotecas correspondentes
+## Honesty
+AI tools were used to help review the code and to translate requests made with CURL into the corresponding libraries.
