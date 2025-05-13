@@ -1,10 +1,21 @@
-#Portfolio generator
+# Portfolio generator
 
 This package uses historical data to calculate the sharpe rating of different portfolios, made using combinations of the Dow 30.
 
-To run this project, with cabal and ghc installed run
-<code>cabal build</code>
-<code>cabal run Paralelismo -- +RTS -N</code>
+To run this project, with cabal and ghc installed run  
+<code>cabal build</code>  
+<code>cabal run Paralelismo -- +RTS -N</code> 
+
+The project also includes a module for dynamically fetching the data used. To use it, head to  
+https://site.financialmodelingprep.com/  
+Register, and access the dashboard. There, get your api key, and add it to your path. The name used for the environment variable in this project is 
+
+<code>export FMP_KEY=YOUR_KEY_HERE </code>  
+
+Afterwards, to download the data, simply run 
+<code>cabal run Dow30</code>  
+
+
 
 Despite the parallelism, the project still takes a significant amount of time. With a k of 1000, it took around 2h for the project to run.
 Lower values for k, such as 10 or 100 yield significantly faster results
@@ -38,3 +49,6 @@ The best sharpe value found was of 3.448845328463113, with a portfolio made up b
 | MCD    | 0.035703 |
 | MRK    | 0.063276 |
 | MSFT   | 0.013938 |
+
+## Honesty
+AI tools were used to help review the code and to translate requests made with CURL into the corresponding libraries.
